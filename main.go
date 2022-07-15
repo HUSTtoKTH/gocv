@@ -4,94 +4,117 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"os"
 
 	"gocv.io/x/gocv"
 )
 
+func min(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b float32) float32 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func main() {
-	// if len(os.Args) < 3 {
-	// 	fmt.Println("How to run:\n\tfacedetect [camera ID] [classifier XML file]")
-	// 	return
-	// }
+	if len(os.Args) < 4 {
+		fmt.Println("How to run:\nssd-facedetect [camera ID] [protofile] [modelfile]")
+		return
+	}
 
 	// parse args
-	deviceID := 0
-	faceXmlFile := "haarcascade_frontalface_default.xml"
-	eyeXmlFile := "haarcascade_eye.xml"
+	deviceID := os.Args[1]
+	proto := os.Args[2]
+	model := os.Args[3]
 
-	// open webcam
-	webcam, err := gocv.VideoCaptureDevice(int(deviceID))
+	// open capture device
+	webcam, err := gocv.OpenVideoCapture(deviceID)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("Error opening video capture device: %v\n", deviceID)
 		return
 	}
 	defer webcam.Close()
 
-	// open display window
-	window := gocv.NewWindow("Face Detect")
+	window := gocv.NewWindow("SSD Face Detection")
 	defer window.Close()
 
-	// prepare image matrix
 	img := gocv.NewMat()
 	defer img.Close()
 
-	// color for the rect when faces detected
-	blue := color.RGBA{0, 0, 255, 0}
-
-	// load faceClassifier to recognize faces
-	faceClassifier := gocv.NewCascadeClassifier()
-	defer faceClassifier.Close()
-
-	if !faceClassifier.Load(faceXmlFile) {
-		fmt.Printf("Error reading cascade file: %v\n", faceXmlFile)
+	// open DNN classifier
+	net := gocv.ReadNetFromCaffe(proto, model)
+	if net.Empty() {
+		fmt.Printf("Error reading network model from : %v %v\n", proto, model)
 		return
 	}
-	// load faceClassifier to recognize eyes
-	eyeClassifier := gocv.NewCascadeClassifier()
-	defer eyeClassifier.Close()
+	defer net.Close()
 
-	if !eyeClassifier.Load(eyeXmlFile) {
-		fmt.Printf("Error reading cascade file: %v\n", eyeXmlFile)
-		return
-	}
+	green := color.RGBA{0, 255, 0, 0}
+	fmt.Printf("Start reading device: %v\n", deviceID)
 
-	fmt.Printf("start reading camera device: %v\n", deviceID)
 	for {
 		if ok := webcam.Read(&img); !ok {
-			fmt.Printf("cannot read device %d\n", deviceID)
+			fmt.Printf("Device closed: %v\n", deviceID)
 			return
 		}
 		if img.Empty() {
 			continue
 		}
 
-		// detect faces
-		rects := faceClassifier.DetectMultiScale(img)
-		fmt.Printf("found %d faces\n", len(rects))
+		W := float32(img.Cols())
+		H := float32(img.Rows())
+		fmt.Println(W, H)
 
-		// draw a rectangle around each face on the original image,
-		// along with text identifying as "Human"
-		for _, r := range rects {
-			gocv.Rectangle(&img, r, blue, 3)
+		// convert image Mat to 96x128 blob that the detector can analyze
+		blob := gocv.BlobFromImage(img, 1.0, image.Pt(1280, 720), gocv.NewScalar(104.0, 177.0, 123.0, 0), false, false)
+		defer blob.Close()
 
-			size := gocv.GetTextSize("Human", gocv.FontHersheyPlain, 1.2, 2)
-			pt := image.Pt(r.Min.X+(r.Min.X/2)-(size.X/2), r.Min.Y-2)
-			gocv.PutText(&img, "Human", pt, gocv.FontHersheyPlain, 1.2, blue, 2)
+		// feed the blob into the classifier
+		net.SetInput(blob, "data")
 
-			imgFace := img.Region(r)
-			eyes := eyeClassifier.DetectMultiScale(imgFace)
-			fmt.Printf("found %d faces\n", len(eyes))
-			for _, e := range eyes {
-				gocv.Rectangle(&imgFace, e, color.RGBA{0, 255, 0, 0}, 1)
-				size := gocv.GetTextSize("Human", gocv.FontHersheyPlain, 1.2, 2)
-				pt := image.Pt(r.Min.X+(r.Min.X/2)-(size.X/2), r.Min.Y-2)
-				gocv.PutText(&imgFace, "Human", pt, gocv.FontHersheyPlain, 1.2, blue, 2)
+		// run a forward pass through the network
+		detBlob := net.Forward("detection_out")
+		defer detBlob.Close()
+
+		// extract the detections.
+		// for each object detected, there will be 7 float features:
+		// objid, classid, confidence, left, top, right, bottom.
+		detections := gocv.GetBlobChannel(detBlob, 0, 0)
+		defer detections.Close()
+
+		for r := 0; r < detections.Rows(); r++ {
+			// you would want the classid for general object detection,
+			// but we do not need it here.
+			// classid := detections.GetFloatAt(r, 1)
+
+			confidence := detections.GetFloatAt(r, 2)
+			if confidence < 0.5 {
+				continue
 			}
-			imgFace.Close()
 
+			left := detections.GetFloatAt(r, 3) * W
+			top := detections.GetFloatAt(r, 4) * H
+			right := detections.GetFloatAt(r, 5) * W
+			bottom := detections.GetFloatAt(r, 6) * H
+
+			// scale to video size:
+			left = min(max(0, left), W-1)
+			right = min(max(0, right), W-1)
+			bottom = min(max(0, bottom), H-1)
+			top = min(max(0, top), H-1)
+
+			// draw it
+			rect := image.Rect(int(left), int(top), int(right), int(bottom))
+			gocv.Rectangle(&img, rect, green, 3)
 		}
 
-		// show the image in the window, and wait 1 millisecond
 		window.IMShow(img)
 		if window.WaitKey(1) >= 0 {
 			break
